@@ -31,6 +31,7 @@
 
 using namespace std;
 
+#define INTNUM 2   // number of interfaces
 /* A mac address class */
 class MACADDR {
   public:
@@ -265,13 +266,12 @@ void create_tap(char* name, struct interface *inter) {
 
 int main(int argc, char **argv)
 {
-    int cnt1,cntout1;
-    int cnt2,cntout2;
-    struct interface interfaces[3];
-    unsigned char buf_frame1[1536+sizeof(struct ether_header)];
-    unsigned char buf_frame2[1536+sizeof(struct ether_header)];
-    unsigned char out_frame1[1536+sizeof(struct ether_header)];
-    unsigned char out_frame2[1536+sizeof(struct ether_header)];
+    int cnt[INTNUM+1],cntout[INTNUM+1];
+    int i; // Interface index
+    struct interface interfaces[INTNUM+1];
+    unsigned char buf_frame[INTNUM+1][1536+sizeof(struct ether_header)];
+    unsigned char out_frame[INTNUM+1][1536+sizeof(struct ether_header)];
+
     /* The vlan bridge */
     map<MACADDR,Bridge_entry> bridge_map;
   
@@ -290,95 +290,86 @@ int main(int argc, char **argv)
     }
     cout << "DEBUG=" << debug << endl;
 
-    // Tap 1                                                                        
-    create_tap(argv[1],&interfaces[1]);
-    // Tap 2                                                                        
-    create_tap(argv[2],&interfaces[2]);
+    // Create taps
+    for (i=1 ; i < INTNUM+1; i++) {
+      create_tap(argv[i],&interfaces[i]);
+    }
 
     int print_cnt=0;
-    fcntl(interfaces[1].sock, F_SETFL, O_NONBLOCK);
-    fcntl(interfaces[2].sock, F_SETFL, O_NONBLOCK);
-    int maxfd = (interfaces[1].sock>interfaces[2].sock)?interfaces[1].sock:interfaces[2].sock;
 
+    // Setup select
+    int maxfd = 0;
+    for (i=1 ; i < INTNUM+1; i++) {
+      fcntl(interfaces[i].sock, F_SETFL, O_NONBLOCK);
+      maxfd = max(maxfd,interfaces[i].sock);
+    }
+        
     for (;;) {
       fd_set rfds;
       FD_ZERO(&rfds);
-      FD_SET(interfaces[1].sock, &rfds);
-      FD_SET(interfaces[2].sock, &rfds);
+      for (i=1 ; i < INTNUM+1; i++) {
+	FD_SET(interfaces[i].sock, &rfds);
+      }
+      
       int sel_ret = select(maxfd+1, &rfds, NULL, NULL, NULL);
       
       if (sel_ret<0) continue;
-      while (FD_ISSET(interfaces[1].sock, &rfds)) {
-	// Read from interface1 and send to interface2
-	size_t size1 = sizeof interfaces[1].device;
-	cnt1=recvfrom(interfaces[1].sock,buf_frame1,1536,0,(struct sockaddr *)&interfaces[1].device,&size1);
-	if(cnt1<0) {
-	  break;
+      
+      for (i=1 ; i < INTNUM+1; i++) {
+	//for (i=INTNUM ; i > 0; i--) {
+	while (FD_ISSET(interfaces[i].sock, &rfds)) {
+	  // Read from interface1 and send to interface2
+	  size_t size = sizeof interfaces[i].device;
+	  cnt[i]=recvfrom(interfaces[i].sock,buf_frame[i],1536,0,(struct sockaddr *)&interfaces[i].device,&size);
+	  if(cnt[i]<0) {
+	    break;
+	  }
+	  if(interfaces[i].device.sll_ifindex != interfaces[i].card_index) {
+	    break; /* Not our interface */
+	  }
+	  // Check for dup of what we sent
+	  int dup = 0;
+	  for (int j=1 ; j < INTNUM+1; j++) {
+	    for (int k=1 ; k < INTNUM+1; k++) {
+	      if (k!=j) {
+		if (dup_pkt(buf_frame[j],cnt[j],out_frame[k],cntout[k])) {
+		  if (debug==2)
+		    cout << " DUP" << j << " " << k << " " << cnt[j] << endl;
+		  dup=1;
+		  break;
+		}
+	      }
+	      if (dup==1) break;
+	    }
+	  }
+	  if (dup==1) break;
+	  
+	  short frwd = bridge_packet(&bridge_map,i,buf_frame[i]);
+	  if (frwd == i || frwd == -1) {
+	    break;
+	  }
+	  cout << "BR: " << i << " to " << frwd << endl;
+	  // For now (two interface) just send broadcast to other interface
+	  if (frwd == 0)
+	    if (i==1)
+	      frwd=2;
+	    else
+	      frwd=1;
+	  
+	  if(debug==2 ) {
+	    cout << i << " to " << frwd  << " ";
+	    printpacket("pkt", buf_frame[i], cnt[i]);
+	  }
+	  // Save frame to watch for it coming back in
+	  memcpy(out_frame[frwd],buf_frame[i],cnt[i]);
+	  cntout[frwd] = sendto(interfaces[frwd].sock, buf_frame[i], cnt[i],0,(struct sockaddr *)&interfaces[frwd].device, sizeof interfaces[frwd].device);
+	  if(debug==2) {
+	  cout << "Forward: " << cntout[frwd] << endl;
+	  if (print_cnt++%10==0)
+	    print_bridge(&bridge_map);
+	  }
 	}
-	if(interfaces[1].device.sll_ifindex != interfaces[1].card_index) {
-	  break; /* Not our interface */
-	}
-	// Check for dup of what we sent
-	if (dup_pkt(buf_frame1,cnt1,out_frame2,cntout2)) {
-	  cout << " DUP12 " << cnt1 << endl;	  break;
-	}
-	if (dup_pkt(buf_frame1,cnt1,out_frame1,cntout1)) {
-	  cout << " DUP11 " << cnt1 << endl;
-	  break;
-	}
-	short forward_to1 = bridge_packet(&bridge_map,1,buf_frame1);
-	if (forward_to1 == 1 || forward_to1 == -1) {
-	  break;
-	}
-	if(debug==1) {
-	  cout << "F1>" << forward_to1 << endl;
-	}
-	if(debug==2 ) printpacket("1 to 2", buf_frame1, cnt1);
-
-	// Save frame to watch for it coming back in
-	memcpy(out_frame2,buf_frame1,cnt1);
-	cntout2 = sendto(interfaces[2].sock, buf_frame1, cnt1,0,(struct sockaddr *)&interfaces[2].device, sizeof interfaces[2].device);
-	cout << "Sent2: " << cntout2 << endl;
-	if (print_cnt++%10==0)
-	  print_bridge(&bridge_map);
-	break;
       }
-
-      while (FD_ISSET(interfaces[2].sock, &rfds)) {
-	// Read from interface1 and send to interface2
-	size_t size2 = sizeof interfaces[2].device;
-	cnt2=recvfrom(interfaces[2].sock,buf_frame2,1536,0,(struct sockaddr *)&interfaces[2].device,&size2);
-	if(cnt2<0) {
-	  break;
-	}
-	if(interfaces[2].device.sll_ifindex != interfaces[2].card_index) {
-	  break; /* Not our interface */
-	}
-	// Check for dup of what we sent
-	if (dup_pkt(buf_frame2,cnt2,out_frame2,cntout2)) {
-	  cout << " DUP22 " << cnt2 << endl;
-	  break;
-	}
-	if (dup_pkt(buf_frame2,cnt2,out_frame1,cntout1)) {
-	  cout << " DUP21 " << cnt2 << endl;
-	  break;
-	}
-	short forward_to2 = bridge_packet(&bridge_map,2,buf_frame2);
-	if (forward_to2 == 2 || forward_to2 == -1) {
-	  break;
-	}
-	if(debug==1) {
-	  cout << "F2>" << forward_to2 << endl;
-	}
-	if(debug==2 ) printpacket("2 to 1", buf_frame2, cnt2);
-
-	// Save frame to watch for it coming back in
-	memcpy(out_frame1,buf_frame2,cnt2);
-	cntout1 = sendto(interfaces[1].sock, buf_frame2, cnt2,0,(struct sockaddr *)&interfaces[1].device, sizeof interfaces[1].device);
-	cout << "Sent1: " << cntout1 << endl;
-
-	continue;
-      }
-
     }
 }
+
